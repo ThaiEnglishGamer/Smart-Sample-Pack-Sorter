@@ -23,14 +23,14 @@ class SampleSorter:
         self.classes = None
         self.confidence_threshold = confidence_threshold
         
-        # --- Updated Keyword Map to match your new folder structure ---
+        # --- Updated Keyword Map to match your folder structure ---
         self.keyword_map = {
             # Drums
             'kick': 'Drums_Kick', 'kik': 'Drums_Kick',
             'snare': 'Drums_Snare', 'snr': 'Drums_Snare',
             'clap': 'Drums_Clap', 'clp': 'Drums_Clap',
             'hat': 'Drums_Cymbals', 'hihat': 'Drums_Cymbals', 'cymbal': 'Drums_Cymbals', 'ride': 'Drums_Cymbals',
-            'crash': 'Drums_Crash', 'crsh': 'Drums_Crash', # Note: Maps to Drums_Crash
+            'crash': 'Drums_Crash', 'crsh': 'Drums_Crash',
             'fill': 'Drums_Fills',
             'perc': 'Drums_Percussion',
             # Loops
@@ -102,7 +102,6 @@ class SampleSorter:
             mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=n_mfcc)
             return np.mean(mfccs.T, axis=0)
         except Exception as e:
-            # This block handles corrupted files by printing an error and returning None.
             print(f"Error processing {file_path}: {e}")
             return None
 
@@ -115,7 +114,7 @@ class AudioClassifier:
         self.encoder = LabelEncoder()
 
     def extract_features(self, file_path, sr=22050, n_mfcc=13):
-        """This function is robust against file errors."""
+        """This function is robust against file errors that can be caught."""
         try:
             audio, sample_rate = librosa.load(file_path, sr=sr, res_type='kaiser_fast')
             target_samples = AUDIO_TARGET_LENGTH * sample_rate
@@ -132,13 +131,11 @@ class AudioClassifier:
         """
         features, labels = [], []
         
-        # --- NEW: Pre-scan to count samples and filter out small classes ---
         all_class_labels = [d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d))]
         valid_class_labels = []
         print("\n--- Analyzing Dataset ---")
         for label in all_class_labels:
             class_dir = os.path.join(dataset_path, label)
-            # Count valid files, not just any entry
             num_samples = len([f for f in os.listdir(class_dir) if os.path.isfile(os.path.join(class_dir, f))])
             if num_samples < MIN_SAMPLES_PER_CLASS:
                 print(f"[WARNING] Skipping class '{label}': Only found {num_samples} samples (minimum is {MIN_SAMPLES_PER_CLASS}).")
@@ -148,19 +145,23 @@ class AudioClassifier:
         
         print(f"\nTraining with {len(valid_class_labels)} valid classes.")
         
-        # --- Main data loading loop using only valid classes ---
         for label in valid_class_labels:
             class_dir = os.path.join(dataset_path, label)
             for filename in os.listdir(class_dir):
                 file_path = os.path.join(class_dir, filename)
                 if os.path.isfile(file_path):
+                    # --- DEBUGGING PRINT STATEMENT ---
+                    # This will force the program to print the file path just before trying to process it.
+                    # The last path printed before a crash is the problematic file.
+                    print(f"--> Attempting to process: {file_path}", flush=True)
+                    
                     data = self.extract_features(file_path)
                     if data is not None:
                         features.append(data)
                         labels.append(label)
 
         if not features:
-            return None, None, None # Return None if no data was loaded
+            return None, None, None
 
         encoded_labels = self.encoder.fit_transform(labels)
         return np.array(features), to_categorical(encoded_labels), self.encoder.classes_
@@ -197,7 +198,6 @@ class AudioClassifier:
             print(f"Model saved to '{MODEL_FILE_NAME}' and '{CLASSES_FILE_NAME}'")
 
 if __name__ == '__main__':
-    # The '..' moves up one directory from 'src' to find the 'dataset' folder.
     DATASET_PATH = os.path.join('..', 'dataset')
     
     classifier = AudioClassifier()
