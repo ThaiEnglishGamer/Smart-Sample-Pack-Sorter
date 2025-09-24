@@ -15,7 +15,7 @@ def extract_features_live(file_path, n_mfcc=13):
     """
     This is the robust ffmpeg extractor for real-time prediction by the GUI.
     """
-    try
+    try:
         command = [
             'ffmpeg', '-i', file_path, '-f', 's16le', '-ac', '1',
             '-ar', str(TARGET_SR), '-loglevel', 'error', '-'
