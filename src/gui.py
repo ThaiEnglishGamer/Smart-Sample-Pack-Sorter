@@ -2,11 +2,14 @@ import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 import os
 import threading
+# --- NEW: Import multiprocessing to prevent crashes ---
+import multiprocessing
 
-# --- MODIFIED: Import the new functions ---
 from file_handler import scan_directory, sort_files, revert_last_sort
-from audio_classifier import SampleSorter
+# --- MODIFIED: Import from our new predictor file ---
+from predictor import SampleSorter, extract_features_live
 
+# ... (The Tk and App __init__ class definitions are the same)
 class Tk(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -21,12 +24,10 @@ class App(Tk):
 
         self.selected_directory = None
         self.files_to_sort = []
-        # --- MODIFIED: The model needs to be loaded from the new 'models' directory ---
         self.sorter = SampleSorter()
-
+        # ... (rest of __init__ is the same as before)
         self.main_frame = ctk.CTkFrame(self)
         self.main_frame.pack(padx=20, pady=20, fill="both", expand=True)
-        # ... (rest of __init__ is the same until the handler/sorter methods)
         self.main_frame.grid_columnconfigure(0, weight=1)
         self.main_frame.grid_rowconfigure(2, weight=1)
         self.dir_box_label = ctk.CTkLabel(self.main_frame, text="Drag and Drop Your Sample Pack Directory Here", fg_color=("gray75", "gray25"), corner_radius=8)
@@ -53,7 +54,64 @@ class App(Tk):
         self.revert_button = ctk.CTkButton(self.button_frame, text="Revert Last Sort", command=self.revert_sorting_thread)
         self.revert_button.pack_forget()
 
+    # --- THIS IS THE NEW, CRASH-PROOF run_sorting METHOD ---
+    def run_sorting(self):
+        """The actual sorting logic that runs in a thread."""
+        self.progress_bar.set(0)
 
+        if not self.sorter.load_model():
+            self.status_label.configure(text="Error: AI model not found in 'models' folder.")
+            self.set_ui_state(is_busy=False)
+            return
+
+        total_files = len(self.files_to_sort)
+        predictions = []
+
+        # Use a multiprocessing Pool to run feature extraction in safe, separate processes
+        with multiprocessing.Pool() as pool:
+            for i, file_path in enumerate(self.files_to_sort):
+                # Stage 1: Check keywords first (fast, no AI needed)
+                filename_lower = os.path.basename(file_path).lower()
+                keyword_found = False
+                for keyword, category in self.sorter.keyword_map.items():
+                    if keyword in filename_lower:
+                        predictions.append((file_path, category))
+                        keyword_found = True
+                        break
+                
+                # Stage 2: If no keyword, use the AI model
+                if not keyword_found:
+                    # Extract features in a separate process to avoid crashes
+                    features = pool.apply(extract_features_live, (file_path,))
+                    
+                    if features is not None:
+                        # Perform the prediction in the main thread
+                        features_expanded = np.expand_dims(features, axis=0)
+                        prediction = self.sorter.model.predict(features_expanded, verbose=0)[0]
+                        confidence = np.max(prediction)
+                        
+                        if confidence >= self.sorter.confidence_threshold:
+                            category = self.sorter.classes[np.argmax(prediction)]
+                        else:
+                            category = "_Uncategorized"
+                        predictions.append((file_path, category))
+                    else:
+                        predictions.append((file_path, "_Uncategorized"))
+
+                # Update UI
+                progress = (i + 1) / total_files
+                status_text = f"[{i+1}/{total_files}] Classifying: {os.path.basename(file_path)}"
+                self.after(0, lambda p=progress, s=status_text: self.update_ui(p, s))
+
+        # Now, move the files
+        self.after(0, lambda: self.status_label.configure(text="All files classified. Now moving..."))
+        result_message = sort_files(self.selected_directory, predictions)
+        self.after(0, lambda: self.status_label.configure(text=result_message))
+        
+        self.after(0, lambda: self.handle_drop_refresh())
+        self.after(0, lambda: self.set_ui_state(is_busy=False))
+
+    # ... (the rest of the gui.py file remains the same)
     def handle_drop(self, event):
         path = event.data.strip('{}')
         if os.path.isdir(path):
@@ -70,16 +128,13 @@ class App(Tk):
             else: self.revert_button.pack_forget()
 
     def set_ui_state(self, is_busy):
-        """Helper function to enable/disable UI elements."""
         state = "disabled" if is_busy else "normal"
         self.start_button.configure(state=state)
-        # Only re-enable revert if a log file exists
-        if not is_busy and os.path.exists(os.path.join(self.selected_directory, "sample_sorter_log.csv")):
+        if not is_busy and self.selected_directory and os.path.exists(os.path.join(self.selected_directory, "sample_sorter_log.csv")):
             self.revert_button.configure(state="normal")
         else:
              self.revert_button.configure(state="disabled")
 
-    # --- MODIFIED: Sorting is now run in a separate thread to prevent GUI freezing ---
     def start_sorting_thread(self):
         self.set_ui_state(is_busy=True)
         threading.Thread(target=self.run_sorting, daemon=True).start()
@@ -88,55 +143,16 @@ class App(Tk):
         self.set_ui_state(is_busy=True)
         threading.Thread(target=self.run_revert, daemon=True).start()
 
-    def run_sorting(self):
-        """The actual sorting logic that runs in a thread."""
-        self.progress_bar.set(0)
-        
-        # --- MODIFIED: Load model from the correct directory ---
-        # We need to temporarily change directory so the relative paths in audio_classifier.py work
-        os.chdir('..') # Go up to the main project directory
-        model_loaded = self.sorter.load_model()
-        os.chdir('src') # Go back to the src directory
-
-        if not model_loaded:
-            self.status_label.configure(text="Error: AI model not found in 'models' folder.")
-            self.set_ui_state(is_busy=False)
-            return
-            
-        total_files = len(self.files_to_sort)
-        predictions = []
-        for i, file_path in enumerate(self.files_to_sort):
-            category, reason = self.sorter.predict_category(file_path)
-            predictions.append((file_path, category))
-            
-            # --- MODIFIED: Use `after` to safely update GUI from a thread ---
-            progress = (i + 1) / total_files
-            status_text = f"[{i+1}/{total_files}] Classifying: {os.path.basename(file_path)}"
-            self.after(0, lambda p=progress, s=status_text: self.update_ui(p, s))
-
-        # Now, call the file handler to move the files
-        self.after(0, lambda: self.status_label.configure(text="All files classified. Now moving..."))
-        result_message = sort_files(self.selected_directory, predictions)
-        self.after(0, lambda: self.status_label.configure(text=result_message))
-        
-        # Rescan the directory to update the file count and revert button status
-        self.after(0, lambda: self.handle_drop_refresh())
-        self.after(0, lambda: self.set_ui_state(is_busy=False))
-
     def run_revert(self):
-        """The actual reverting logic that runs in a thread."""
         self.status_label.configure(text="Reverting last sort operation...")
         result_message = revert_last_sort(self.selected_directory)
         self.status_label.configure(text=result_message)
-        # Rescan the directory to update UI
         self.after(0, lambda: self.handle_drop_refresh())
         self.after(0, lambda: self.set_ui_state(is_busy=False))
 
     def update_ui(self, progress, status_text):
-        """Safely updates UI elements."""
         self.progress_bar.set(progress)
         self.status_label.configure(text=status_text)
     
     def handle_drop_refresh(self):
-        """A version of handle_drop that doesn't need an event, for refreshing."""
         self.handle_drop(type('event', (), {'data': self.selected_directory})())
