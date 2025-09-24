@@ -140,9 +140,3 @@ class App(Tk):
     def handle_drop_refresh(self):
         """A version of handle_drop that doesn't need an event, for refreshing."""
         self.handle_drop(type('event', (), {'data': self.selected_directory})())
-
-if __name__ == '__main__':
-    ctk.set_appearance_mode("System")
-    ctk.set_default_color_theme("blue")
-    app = App()
-    app.mainloop()
