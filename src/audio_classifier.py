@@ -11,7 +11,8 @@ from tensorflow.keras.utils import to_categorical
 # --- Configuration ---
 MODEL_FILE_NAME = "audio_classifier_model.keras"
 CLASSES_FILE_NAME = "classes.npy"
-AUDIO_TARGET_LENGTH = 2 # in seconds
+AUDIO_TARGET_LENGTH = 2  # in seconds
+MIN_SAMPLES_PER_CLASS = 10 # Minimum samples required to include a category in training
 
 # ==============================================================================
 #  CLASS 1: THE SORTER (Used by the GUI)
@@ -22,26 +23,25 @@ class SampleSorter:
         self.classes = None
         self.confidence_threshold = confidence_threshold
         
-        # --- The heart of the filename analysis ---
-        # Maps keywords to your final folder names. Order matters: more specific keywords first.
+        # --- Updated Keyword Map to match your new folder structure ---
         self.keyword_map = {
             # Drums
             'kick': 'Drums_Kick', 'kik': 'Drums_Kick',
             'snare': 'Drums_Snare', 'snr': 'Drums_Snare',
             'clap': 'Drums_Clap', 'clp': 'Drums_Clap',
             'hat': 'Drums_Cymbals', 'hihat': 'Drums_Cymbals', 'cymbal': 'Drums_Cymbals', 'ride': 'Drums_Cymbals',
-            'crash': 'Drums_Crash', 'crsh': 'Drums_Crash',
+            'crash': 'Drums_Crash', 'crsh': 'Drums_Crash', # Note: Maps to Drums_Crash
             'fill': 'Drums_Fills',
             'perc': 'Drums_Percussion',
             # Loops
-            'drumloop': 'Loop_Drums', 'drum loop': 'Loop_Drums',
+            'drumloop': 'Loops_Drums', 'drum loop': 'Loops_Drums',
             'bassline': 'Loops_Synth_Bass', 'bass loop': 'Loops_Synth_Bass',
             'chord loop': 'Loops_Synth_Chords',
             'lead loop': 'Loops_Synth_Lead', 'melody': 'Loops_Synth_Lead',
             # Samples
             'piano': 'Sample_Piano',
             'synth': 'Sample_Synth',
-            'bass': 'Sample_Synth_Bass', # Must be after bassline/bass loop to not misclassify loops
+            'bass': 'Sample_Synth_Bass',
             'shot': 'Sample_Oneshot',
             # FX
             'impact': 'FX_Impact', 'imp': 'FX_Impact',
@@ -65,7 +65,7 @@ class SampleSorter:
     def predict_category(self, file_path):
         """
         Predicts category using the hybrid Filename + AI approach.
-        Returns the category name (e.g., 'Drums_Kick')
+        Returns the category name (e.g., 'Drums_Kick') and the reason.
         """
         # --- Stage 1: Filename Analysis ---
         filename = os.path.basename(file_path).lower()
@@ -81,7 +81,7 @@ class SampleSorter:
         if features is None:
             return "_Uncategorized", "Feature Extraction Error"
 
-        features = np.expand_dims(features, axis=0) # Reshape for prediction
+        features = np.expand_dims(features, axis=0)
         prediction = self.model.predict(features, verbose=0)[0]
         
         confidence = np.max(prediction)
@@ -102,6 +102,7 @@ class SampleSorter:
             mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=n_mfcc)
             return np.mean(mfccs.T, axis=0)
         except Exception as e:
+            # This block handles corrupted files by printing an error and returning None.
             print(f"Error processing {file_path}: {e}")
             return None
 
@@ -109,13 +110,12 @@ class SampleSorter:
 #  CLASS 2: THE TRAINER (Used for training the model from the command line)
 # ==============================================================================
 class AudioClassifier:
-    # This class is largely the same as before, used only for training.
-    # Its purpose is to create the .keras and .npy files that SampleSorter uses.
     def __init__(self):
         self.model = None
         self.encoder = LabelEncoder()
 
     def extract_features(self, file_path, sr=22050, n_mfcc=13):
+        """This function is robust against file errors."""
         try:
             audio, sample_rate = librosa.load(file_path, sr=sr, res_type='kaiser_fast')
             target_samples = AUDIO_TARGET_LENGTH * sample_rate
@@ -123,14 +123,33 @@ class AudioClassifier:
             mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=n_mfcc)
             return np.mean(mfccs.T, axis=0)
         except Exception as e:
-            print(f"Error processing {file_path}: {e}")
+            print(f"SKIPPING corrupt or unreadable file: {os.path.basename(file_path)} | Error: {e}")
             return None
 
     def load_data(self, dataset_path):
+        """
+        Loads data, automatically ignoring corrupted files and classes with too few samples.
+        """
         features, labels = [], []
-        class_labels = [d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d))]
-        print(f"Found classes: {class_labels}")
-        for label in class_labels:
+        
+        # --- NEW: Pre-scan to count samples and filter out small classes ---
+        all_class_labels = [d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d))]
+        valid_class_labels = []
+        print("\n--- Analyzing Dataset ---")
+        for label in all_class_labels:
+            class_dir = os.path.join(dataset_path, label)
+            # Count valid files, not just any entry
+            num_samples = len([f for f in os.listdir(class_dir) if os.path.isfile(os.path.join(class_dir, f))])
+            if num_samples < MIN_SAMPLES_PER_CLASS:
+                print(f"[WARNING] Skipping class '{label}': Only found {num_samples} samples (minimum is {MIN_SAMPLES_PER_CLASS}).")
+            else:
+                print(f"Class '{label}': Found {num_samples} samples. OK.")
+                valid_class_labels.append(label)
+        
+        print(f"\nTraining with {len(valid_class_labels)} valid classes.")
+        
+        # --- Main data loading loop using only valid classes ---
+        for label in valid_class_labels:
             class_dir = os.path.join(dataset_path, label)
             for filename in os.listdir(class_dir):
                 file_path = os.path.join(class_dir, filename)
@@ -139,6 +158,10 @@ class AudioClassifier:
                     if data is not None:
                         features.append(data)
                         labels.append(label)
+
+        if not features:
+            return None, None, None # Return None if no data was loaded
+
         encoded_labels = self.encoder.fit_transform(labels)
         return np.array(features), to_categorical(encoded_labels), self.encoder.classes_
 
@@ -150,20 +173,22 @@ class AudioClassifier:
             Dense(num_classes, activation='softmax')
         ])
         self.model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-        print(self.model.summary())
+        print("\n--- Model Architecture ---")
+        self.model.summary()
 
     def train(self, dataset_path):
         X, y, self.classes_ = self.load_data(dataset_path)
-        if len(X) == 0:
-            print("No data loaded. Please check your dataset folder.")
+        if X is None:
+            print("\nTraining aborted: No valid data was loaded. Please check your dataset folder and sample counts.")
             return
+            
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         self.build_model((X_train.shape[1],), y_train.shape[1])
         print("\n--- Starting Model Training ---")
         self.model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_test, y_test), verbose=2)
         print("--- Model Training Complete ---\n")
         loss, accuracy = self.model.evaluate(X_test, y_test, verbose=0)
-        print(f"Model Accuracy on Test Data: {accuracy * 100:.2f}%")
+        print(f"Final Model Accuracy on Test Data: {accuracy * 100:.2f}%")
 
     def save_model(self):
         if self.model:
@@ -172,7 +197,9 @@ class AudioClassifier:
             print(f"Model saved to '{MODEL_FILE_NAME}' and '{CLASSES_FILE_NAME}'")
 
 if __name__ == '__main__':
+    # The '..' moves up one directory from 'src' to find the 'dataset' folder.
     DATASET_PATH = os.path.join('..', 'dataset')
+    
     classifier = AudioClassifier()
     classifier.train(DATASET_PATH)
     classifier.save_model()
