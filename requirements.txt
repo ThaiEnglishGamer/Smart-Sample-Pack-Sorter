@@ -1,0 +1,22 @@
+# -----------------------------------------------------------------
+# This file lists the Python packages required for the
+# AI Sample Pack Sorter project.
+#
+# To install all packages, run this command in your terminal:
+# pip install -r requirements.txt
+# -----------------------------------------------------------------
+
+# --- GUI ---
+customtkinter
+tkinterdnd2
+
+# --- Machine Learning & Data Processing ---
+tensorflow      # The core AI/deep learning framework
+numpy           # Fundamental package for numerical operations
+scikit-learn    # For data splitting and label encoding
+
+# --- Audio Processing ---
+librosa         # For audio feature extraction (MFCCs)
+
+# --- Data Handling (for the future log file) ---
+pandas          # For creating and managing the CSV log for the revert feature

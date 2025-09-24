@@ -7,19 +7,27 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
 from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import LearningRateScheduler # NEW: For smarter training
 
-# --- THIS SCRIPT HAS NO LIBSROSA OR SUBPROCESS ---
+# --- MODIFIED: Paths now point to the correct new folders ---
+MODEL_DIR = os.path.join('..', 'models')
+DATA_DIR = os.path.join('..', 'data')
+MODEL_FILE_NAME = os.path.join(MODEL_DIR, "audio_classifier_model.keras")
+CLASSES_FILE_NAME = os.path.join(MODEL_DIR, "classes.npy")
+PREPROCESSED_DATA_FILE = os.path.join(DATA_DIR, 'preprocessed_data.npz')
 
-# --- Configuration ---
-MODEL_FILE_NAME = "audio_classifier_model.keras"
-CLASSES_FILE_NAME = "classes.npy"
-PREPROCESSED_DATA_FILE = 'preprocessed_data.npz'
+# NEW: Learning Rate Scheduler function
+def lr_scheduler(epoch, lr):
+    """Gradually reduces the learning rate over epochs."""
+    if epoch > 0 and epoch % 30 == 0:
+        return lr * 0.5
+    return lr
 
 def train_model():
     """Loads preprocessed data and trains the Keras model."""
-    print("\n--- STAGE 2: TRAINING ---")
+    print("\n--- STAGE 2: TRAINING (High Accuracy Mode) ---")
+    os.makedirs(MODEL_DIR, exist_ok=True)
     
-    # 1. Load the data created by preprocess.py
     if not os.path.exists(PREPROCESSED_DATA_FILE):
         print(f"ERROR: Data file '{PREPROCESSED_DATA_FILE}' not found.")
         print("Please run 'python preprocess.py' first to generate the data.")
@@ -30,38 +38,42 @@ def train_model():
     X = data['X']
     y_raw = data['y']
     
-    # 2. Encode labels
     encoder = LabelEncoder()
     y_encoded = encoder.fit_transform(y_raw)
     y = to_categorical(y_encoded)
     
-    # 3. Split data
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
-    # 4. Build and train the model
     input_shape = (X_train.shape[1],)
     num_classes = y_train.shape[1]
     
+    # --- MODIFIED: Deeper model architecture ---
     model = Sequential([
-        Dense(256, activation='relu', input_shape=input_shape), BatchNormalization(), Dropout(0.5),
-        Dense(128, activation='relu'), BatchNormalization(), Dropout(0.5),
+        Dense(512, activation='relu', input_shape=input_shape), BatchNormalization(), Dropout(0.5),
+        Dense(256, activation='relu'), BatchNormalization(), Dropout(0.5),
+        Dense(128, activation='relu'), BatchNormalization(), Dropout(0.5), # New layer
         Dense(64, activation='relu'),
         Dense(num_classes, activation='softmax')
     ])
     model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-    print("\n--- Model Architecture ---")
+    print("\n--- Upgraded Model Architecture ---")
     model.summary()
 
-    print("\n--- Starting Model Training ---")
+    # NEW: Create the learning rate callback
+    lr_callback = LearningRateScheduler(lr_scheduler)
+
+    print("\n--- Starting Model Training (150 Epochs) ---")
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf.runtime_version')
-        model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_test, y_test), verbose=2)
+        # --- MODIFIED: Increased epochs and added the callback ---
+        model.fit(X_train, y_train, epochs=150, batch_size=32,
+                  validation_data=(X_test, y_test),
+                  callbacks=[lr_callback], verbose=2)
     
     print("--- Model Training Complete ---\n")
     loss, accuracy = model.evaluate(X_test, y_test, verbose=0)
     print(f"Final Model Accuracy on Test Data: {accuracy * 100:.2f}%")
 
-    # 5. Save the final model and the class encoder
     model.save(MODEL_FILE_NAME)
     np.save(CLASSES_FILE_NAME, encoder.classes_)
     print(f"Model saved to '{MODEL_FILE_NAME}' and '{CLASSES_FILE_NAME}'")
