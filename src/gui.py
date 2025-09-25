@@ -1,3 +1,4 @@
+
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 import os
@@ -5,7 +6,7 @@ import threading
 import multiprocessing
 import numpy as np
 
-from file_handler import scan_directory, sort_files, revert_last_sort, isolate_unprocessable_file
+from file_handler import scan_directory, sort_files_transactional, revert_last_sort, isolate_unprocessable_file
 from predictor import SampleSorter, extract_features_live
 
 class Tk(ctk.CTk, TkinterDnD.DnDWrapper):
@@ -19,14 +20,13 @@ class App(Tk):
         self.title("AI Sample Pack Sorter")
         self.geometry("700x550")
         self.minsize(500, 400)
-
         self.selected_directory = None
         self.files_to_sort = []
         self.sorter = SampleSorter()
         self.stop_event = None
-        self.process_pool = None # To hold our pool so we can terminate it
-
-        # ... (GUI widget definitions are unchanged)
+        self.process_pool = None
+        
+        # --- (GUI layout code is unchanged) ---
         self.main_frame = ctk.CTkFrame(self)
         self.main_frame.pack(padx=20, pady=20, fill="both", expand=True)
         self.main_frame.grid_columnconfigure(0, weight=1)
@@ -57,7 +57,7 @@ class App(Tk):
         self.stop_button = ctk.CTkButton(self.button_frame, text="Stop Sorting", command=self.stop_sorting, fg_color="red", hover_color="darkred")
         self.stop_button.pack_forget()
 
-    # ... (handle_drop is unchanged)
+    # --- (handle_drop, set_ui_state, etc. are largely the same) ---
     def handle_drop(self, event):
         path = event.data.strip('{}')
         if os.path.isdir(path):
@@ -90,29 +90,33 @@ class App(Tk):
     
     def stop_sorting(self):
         if self.stop_event: self.stop_event.set()
-        # --- NEW: The Kill Switch ---
         if self.process_pool: self.process_pool.terminate()
         self.status_label.configure(text="Stopping process... please wait.")
-
+    
+    def update_progress(self, current, total, message):
+        """A dedicated callback function to safely update the UI."""
+        progress = current / total
+        status_text = f"[{current}/{total}] {message}"
+        self.progress_bar.set(progress)
+        self.status_label.configure(text=status_text)
+    
     def run_sorting(self):
         if not self.sorter.load_model():
-            self.after(0, lambda: self.status_label.configure(text="Error: AI model not found in 'models' folder."))
+            self.after(0, lambda: self.status_label.configure(text="Error: AI model not found."))
             self.after(0, lambda: self.set_ui_state_for_sorting(is_sorting=False))
             return
 
-        total_files = len(self.files_to_sort)
         predictions = []
+        total_files = len(self.files_to_sort)
         
         self.process_pool = multiprocessing.Pool()
         try:
             async_results = []
             for file_path in self.files_to_sort:
+                if self.stop_event.is_set(): break
                 filename_lower = os.path.basename(file_path).lower()
-                keyword_category = None
-                for keyword, category in self.sorter.keyword_map.items():
-                    if keyword in filename_lower:
-                        keyword_category = category
-                        break
+                keyword_category = next((cat for key, cat in self.sorter.keyword_map.items() if key in filename_lower), None)
+                
                 if keyword_category:
                     async_results.append({'file_path': file_path, 'result': keyword_category, 'is_keyword': True})
                 else:
@@ -123,60 +127,49 @@ class App(Tk):
                 if self.stop_event.is_set(): break
                 
                 file_path = item['file_path']
-                category = ""
+                self.after(0, lambda c=i+1, t=total_files, m=f"Classifying: {os.path.basename(file_path)}": self.update_progress(c, t, m))
                 
+                category = ""
                 if item['is_keyword']:
                     category = item['result']
                 else:
                     try:
-                        # --- MODIFIED: Added the timeout ---
                         features = item['result'].get(timeout=120)
                         if features is not None:
-                            features_expanded = np.expand_dims(features, axis=0)
-                            prediction = self.sorter.model.predict(features_expanded, verbose=0)[0]
-                            confidence = np.max(prediction)
-                            category = self.sorter.classes[np.argmax(prediction)] if confidence >= self.sorter.confidence_threshold else "_Uncategorized"
-                        else:
-                            category = "_Uncategorized"
+                            pred = self.sorter.model.predict(np.expand_dims(features, axis=0), verbose=0)[0]
+                            conf = np.max(pred)
+                            category = self.sorter.classes[np.argmax(pred)] if conf >= self.sorter.confidence_threshold else "_Uncategorized"
+                        else: category = "_Uncategorized"
                     except multiprocessing.TimeoutError:
-                        # --- MODIFIED: Handle the hung file ---
                         self.after(0, lambda fp=file_path: isolate_unprocessable_file(self.selected_directory, fp))
-                        continue # Skip adding to predictions and move to next file
+                        continue
                     except Exception as e:
-                        print(f"An unexpected error occurred processing {file_path}: {e}")
                         category = "_Uncategorized"
                 
                 predictions.append((file_path, category))
-                progress = (i + 1) / total_files
-                status_text = f"[{i+1}/{total_files}] Classifying: {os.path.basename(file_path)}"
-                self.after(0, lambda p=progress, s=status_text: self.update_ui(p, s))
 
             self.process_pool.close()
             self.process_pool.join()
 
-            if self.stop_event.is_set():
-                self.after(0, lambda: self.status_label.configure(text="Sorting aborted by user."))
-            else:
-                self.after(0, lambda: self.status_label.configure(text="All files classified. Now moving..."))
-                result_message = sort_files(self.selected_directory, predictions)
+            if not self.stop_event.is_set():
+                # --- All predictions are done, now call the transactional sort function ---
+                result_message = sort_files_transactional(self.selected_directory, predictions,
+                                                          lambda c, t, m: self.after(0, self.update_progress, c, t, m),
+                                                          self.stop_event)
                 self.after(0, lambda: self.status_label.configure(text=result_message))
         
         finally:
             self.process_pool = None
             self.after(0, lambda: self.set_ui_state_for_sorting(is_sorting=False))
 
-    # ... (revert methods, update_ui, and handle_drop_refresh are unchanged)
+    # --- (Revert and other helper methods are unchanged) ---
     def revert_sorting_thread(self):
-        self.start_button.configure(state="disabled")
-        self.revert_button.configure(state="disabled")
+        self.set_ui_state_for_sorting(is_sorting=True) # Visually disable buttons
         threading.Thread(target=self.run_revert, daemon=True).start()
     def run_revert(self):
         self.status_label.configure(text="Reverting last sort operation...")
         result_message = revert_last_sort(self.selected_directory)
         self.status_label.configure(text=result_message)
-        self.after(0, lambda: self.handle_drop_refresh())
-    def update_ui(self, progress, status_text):
-        self.progress_bar.set(progress)
-        self.status_label.configure(text=status_text)
+        self.after(0, lambda: self.set_ui_state_for_sorting(is_sorting=False))
     def handle_drop_refresh(self):
         self.handle_drop(type('event', (), {'data': self.selected_directory})())
