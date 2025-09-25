@@ -7,7 +7,7 @@ import json
 import sys
 import numpy as np
 
-from file_handler import scan_directory, sort_files_transactional, revert_last_sort, isolate_unprocessable_file
+from file_handler import scan_directory, organize_library, revert_last_sort, isolate_unprocessable_file
 from predictor import SampleSorter
 
 class Tk(ctk.CTk, TkinterDnD.DnDWrapper):
@@ -23,6 +23,7 @@ class App(Tk):
         self.minsize(500, 400)
         self.selected_directory = None
         self.files_to_sort = []
+        self.non_audio_files = [] # New list for other files
         self.sorter = SampleSorter()
         self.stop_event = threading.Event()
         self.worker_process = None
@@ -64,11 +65,13 @@ class App(Tk):
             self.selected_directory = path
             scan_info = scan_directory(self.selected_directory)
             self.files_to_sort = scan_info["audio_files"]
+            self.non_audio_files = scan_info["non_audio_files"] # Store non-audio files
             log_file_found = scan_info["log_file_found"]
-            self.dir_box_label.configure(text=f"Selected: {path}\nFound {len(self.files_to_sort)} audio files.")
-            self.status_label.configure(text=f"Ready to process {len(self.files_to_sort)} files.")
+            total_files = len(self.files_to_sort) + len(self.non_audio_files)
+            self.dir_box_label.configure(text=f"Selected: {path}\nFound {total_files} total files to process.")
+            self.status_label.configure(text=f"Ready to process {total_files} files.")
             self.progress_bar.set(0)
-            if self.files_to_sort: self.start_button.configure(state="normal")
+            if total_files > 0: self.start_button.configure(state="normal")
             else: self.start_button.configure(state="disabled")
             if log_file_found: self.revert_button.pack(side="left", padx=5)
             else: self.revert_button.pack_forget()
@@ -100,69 +103,62 @@ class App(Tk):
             self.after(0, lambda: self.set_ui_state_for_sorting(is_sorting=False))
             return
             
-        predictions = []
+        audio_predictions = []
         files_for_ai = []
 
-        # --- STAGE 1: Fast Keyword Classification ---
-        self.after(0, self.update_progress, 0, 1, "Phase 1: Classifying files by name...")
+        # STAGE 1: Fast Keyword Classification for audio files
         for file_path in self.files_to_sort:
             filename_lower = os.path.basename(file_path).lower()
             keyword_category = next((cat for key, cat in self.sorter.keyword_map.items() if key in filename_lower), None)
             if keyword_category:
-                predictions.append((file_path, keyword_category))
+                audio_predictions.append((file_path, keyword_category))
             else:
                 files_for_ai.append(file_path)
         
-        # --- STAGE 2: AI Classification in an Isolated Process ---
-        if files_for_ai:
-            self.after(0, self.update_progress, 0, 1, f"Phase 2: Analyzing {len(files_for_ai)} audio files with AI...")
+        # STAGE 2: Isolated AI Classification
+        if files_for_ai and not self.stop_event.is_set():
+            self.after(0, self.update_progress, 0, 1, f"Phase 1/3: Analyzing {len(files_for_ai)} audio files with AI...")
             try:
-                # Get the path to the python executable running this script
                 python_executable = sys.executable
                 worker_script = os.path.join(os.path.dirname(__file__), 'feature_extractor_worker.py')
                 command = [python_executable, worker_script] + files_for_ai
                 
                 self.worker_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 stdout, stderr = self.worker_process.communicate()
-                self.worker_process = None # Clear process after it's done
+                self.worker_process = None
 
-                if self.stop_event.is_set():
-                    self.after(0, self.status_label.configure, {"text": "Sorting aborted by user."})
-                    self.after(0, self.set_ui_state_for_sorting, False)
-                    return
-
-                if stderr:
-                    print("--- Worker Process Errors ---")
-                    print(stderr)
+                if self.stop_event.is_set(): # Check again after the process might have been terminated
+                    raise InterruptedError("Process stopped by user.")
 
                 ai_results = json.loads(stdout)
-                
-                # Process successful results
                 for file_path, features_list in ai_results["success"].items():
                     features = np.array(features_list)
                     pred = self.sorter.model.predict(np.expand_dims(features, axis=0), verbose=0)[0]
                     conf = np.max(pred)
                     category = self.sorter.classes[np.argmax(pred)] if conf >= self.sorter.confidence_threshold else "_Uncategorized"
-                    predictions.append((file_path, category))
-                
-                # Handle failed results
+                    audio_predictions.append((file_path, category))
                 for file_path in ai_results["failed"]:
                     self.after(0, lambda fp=file_path: isolate_unprocessable_file(self.selected_directory, fp))
 
+            except InterruptedError as e:
+                self.after(0, self.status_label.configure, {"text": str(e)})
+                self.after(0, self.set_ui_state_for_sorting, False)
+                return
             except Exception as e:
                 self.after(0, self.status_label.configure, {"text": f"A critical error occurred: {e}"})
                 self.after(0, self.set_ui_state_for_sorting, False)
                 return
 
-        # --- STAGE 3: Transactional File Moving ---
-        self.after(0, self.status_label.configure, {"text": "Phase 3: Moving files to sorted folders..."})
-        result_message = sort_files_transactional(self.selected_directory, predictions,
-                                                  lambda c, t, m: self.after(0, self.update_progress, c, t, m),
-                                                  self.stop_event)
-        self.after(0, self.status_label.configure, {"text": result_message})
+        # STAGE 3: Final Organization
+        if not self.stop_event.is_set():
+            self.after(0, self.status_label.configure, {"text": "Phase 2/3: Organizing all files..."})
+            def progress_callback(c, t, m): self.after(0, self.update_progress, c, t, m)
+            result_message = organize_library(self.selected_directory, audio_predictions, self.non_audio_files, progress_callback, self.stop_event)
+            self.after(0, self.status_label.configure, {"text": result_message})
+
         self.after(0, self.set_ui_state_for_sorting, False)
 
-    # ... (the rest of the methods are unchanged)
+    # --- (helper methods are unchanged) ---
     def update_progress(self, current, total, message):
         self.progress_bar.set(current / total)
         self.status_label.configure(text=message)
