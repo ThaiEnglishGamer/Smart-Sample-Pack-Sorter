@@ -1,13 +1,14 @@
-
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 import os
 import threading
-import multiprocessing
+import subprocess
+import json
+import sys
 import numpy as np
 
 from file_handler import scan_directory, sort_files_transactional, revert_last_sort, isolate_unprocessable_file
-from predictor import SampleSorter, extract_features_live
+from predictor import SampleSorter
 
 class Tk(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self, *args, **kwargs):
@@ -23,10 +24,10 @@ class App(Tk):
         self.selected_directory = None
         self.files_to_sort = []
         self.sorter = SampleSorter()
-        self.stop_event = None
-        self.process_pool = None
-        
-        # --- (GUI layout code is unchanged) ---
+        self.stop_event = threading.Event()
+        self.worker_process = None
+
+        # --- (GUI layout is unchanged) ---
         self.main_frame = ctk.CTkFrame(self)
         self.main_frame.pack(padx=20, pady=20, fill="both", expand=True)
         self.main_frame.grid_columnconfigure(0, weight=1)
@@ -57,7 +58,6 @@ class App(Tk):
         self.stop_button = ctk.CTkButton(self.button_frame, text="Stop Sorting", command=self.stop_sorting, fg_color="red", hover_color="darkred")
         self.stop_button.pack_forget()
 
-    # --- (handle_drop, set_ui_state, etc. are largely the same) ---
     def handle_drop(self, event):
         path = event.data.strip('{}')
         if os.path.isdir(path):
@@ -84,87 +84,90 @@ class App(Tk):
             self.handle_drop_refresh()
 
     def start_sorting_thread(self):
-        self.stop_event = threading.Event()
+        self.stop_event.clear()
         self.set_ui_state_for_sorting(is_sorting=True)
         threading.Thread(target=self.run_sorting, daemon=True).start()
     
     def stop_sorting(self):
-        if self.stop_event: self.stop_event.set()
-        if self.process_pool: self.process_pool.terminate()
-        self.status_label.configure(text="Stopping process... please wait.")
-    
-    def update_progress(self, current, total, message):
-        """A dedicated callback function to safely update the UI."""
-        progress = current / total
-        status_text = f"[{current}/{total}] {message}"
-        self.progress_bar.set(progress)
-        self.status_label.configure(text=status_text)
-    
+        self.status_label.configure(text="Stopping... please wait.")
+        self.stop_event.set()
+        if self.worker_process:
+            self.worker_process.terminate()
+
     def run_sorting(self):
         if not self.sorter.load_model():
             self.after(0, lambda: self.status_label.configure(text="Error: AI model not found."))
             self.after(0, lambda: self.set_ui_state_for_sorting(is_sorting=False))
             return
-
+            
         predictions = []
-        total_files = len(self.files_to_sort)
+        files_for_ai = []
+
+        # --- STAGE 1: Fast Keyword Classification ---
+        self.after(0, self.update_progress, 0, 1, "Phase 1: Classifying files by name...")
+        for file_path in self.files_to_sort:
+            filename_lower = os.path.basename(file_path).lower()
+            keyword_category = next((cat for key, cat in self.sorter.keyword_map.items() if key in filename_lower), None)
+            if keyword_category:
+                predictions.append((file_path, keyword_category))
+            else:
+                files_for_ai.append(file_path)
         
-        self.process_pool = multiprocessing.Pool()
-        try:
-            async_results = []
-            for file_path in self.files_to_sort:
-                if self.stop_event.is_set(): break
-                filename_lower = os.path.basename(file_path).lower()
-                keyword_category = next((cat for key, cat in self.sorter.keyword_map.items() if key in filename_lower), None)
+        # --- STAGE 2: AI Classification in an Isolated Process ---
+        if files_for_ai:
+            self.after(0, self.update_progress, 0, 1, f"Phase 2: Analyzing {len(files_for_ai)} audio files with AI...")
+            try:
+                # Get the path to the python executable running this script
+                python_executable = sys.executable
+                worker_script = os.path.join(os.path.dirname(__file__), 'feature_extractor_worker.py')
+                command = [python_executable, worker_script] + files_for_ai
                 
-                if keyword_category:
-                    async_results.append({'file_path': file_path, 'result': keyword_category, 'is_keyword': True})
-                else:
-                    result_obj = self.process_pool.apply_async(extract_features_live, (file_path,))
-                    async_results.append({'file_path': file_path, 'result': result_obj, 'is_keyword': False})
+                self.worker_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                stdout, stderr = self.worker_process.communicate()
+                self.worker_process = None # Clear process after it's done
 
-            for i, item in enumerate(async_results):
-                if self.stop_event.is_set(): break
+                if self.stop_event.is_set():
+                    self.after(0, self.status_label.configure, {"text": "Sorting aborted by user."})
+                    self.after(0, self.set_ui_state_for_sorting, False)
+                    return
+
+                if stderr:
+                    print("--- Worker Process Errors ---")
+                    print(stderr)
+
+                ai_results = json.loads(stdout)
                 
-                file_path = item['file_path']
-                self.after(0, lambda c=i+1, t=total_files, m=f"Classifying: {os.path.basename(file_path)}": self.update_progress(c, t, m))
+                # Process successful results
+                for file_path, features_list in ai_results["success"].items():
+                    features = np.array(features_list)
+                    pred = self.sorter.model.predict(np.expand_dims(features, axis=0), verbose=0)[0]
+                    conf = np.max(pred)
+                    category = self.sorter.classes[np.argmax(pred)] if conf >= self.sorter.confidence_threshold else "_Uncategorized"
+                    predictions.append((file_path, category))
                 
-                category = ""
-                if item['is_keyword']:
-                    category = item['result']
-                else:
-                    try:
-                        features = item['result'].get(timeout=120)
-                        if features is not None:
-                            pred = self.sorter.model.predict(np.expand_dims(features, axis=0), verbose=0)[0]
-                            conf = np.max(pred)
-                            category = self.sorter.classes[np.argmax(pred)] if conf >= self.sorter.confidence_threshold else "_Uncategorized"
-                        else: category = "_Uncategorized"
-                    except multiprocessing.TimeoutError:
-                        self.after(0, lambda fp=file_path: isolate_unprocessable_file(self.selected_directory, fp))
-                        continue
-                    except Exception as e:
-                        category = "_Uncategorized"
-                
-                predictions.append((file_path, category))
+                # Handle failed results
+                for file_path in ai_results["failed"]:
+                    self.after(0, lambda fp=file_path: isolate_unprocessable_file(self.selected_directory, fp))
 
-            self.process_pool.close()
-            self.process_pool.join()
+            except Exception as e:
+                self.after(0, self.status_label.configure, {"text": f"A critical error occurred: {e}"})
+                self.after(0, self.set_ui_state_for_sorting, False)
+                return
 
-            if not self.stop_event.is_set():
-                # --- All predictions are done, now call the transactional sort function ---
-                result_message = sort_files_transactional(self.selected_directory, predictions,
-                                                          lambda c, t, m: self.after(0, self.update_progress, c, t, m),
-                                                          self.stop_event)
-                self.after(0, lambda: self.status_label.configure(text=result_message))
-        
-        finally:
-            self.process_pool = None
-            self.after(0, lambda: self.set_ui_state_for_sorting(is_sorting=False))
+        # --- STAGE 3: Transactional File Moving ---
+        self.after(0, self.status_label.configure, {"text": "Phase 3: Moving files to sorted folders..."})
+        result_message = sort_files_transactional(self.selected_directory, predictions,
+                                                  lambda c, t, m: self.after(0, self.update_progress, c, t, m),
+                                                  self.stop_event)
+        self.after(0, self.status_label.configure, {"text": result_message})
+        self.after(0, self.set_ui_state_for_sorting, False)
 
-    # --- (Revert and other helper methods are unchanged) ---
+    # ... (the rest of the methods are unchanged)
+    def update_progress(self, current, total, message):
+        self.progress_bar.set(current / total)
+        self.status_label.configure(text=message)
     def revert_sorting_thread(self):
-        self.set_ui_state_for_sorting(is_sorting=True) # Visually disable buttons
+        self.set_ui_state_for_sorting(True)
         threading.Thread(target=self.run_revert, daemon=True).start()
     def run_revert(self):
         self.status_label.configure(text="Reverting last sort operation...")
